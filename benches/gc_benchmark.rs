@@ -1,0 +1,197 @@
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use python_gc::{object::ObjectData, GarbageCollector, PyObject};
+
+fn create_test_objects(count: usize) -> Vec<PyObject> {
+    (0..count)
+        .map(|i| {
+            if i % 3 == 0 {
+                PyObject::new("list".to_string(), ObjectData::List(Vec::new()))
+            } else if i % 3 == 1 {
+                PyObject::new("dict".to_string(), ObjectData::Dict(Vec::new()))
+            } else {
+                PyObject::new("set".to_string(), ObjectData::Set(Vec::new()))
+            }
+        })
+        .collect()
+}
+
+fn benchmark_object_creation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Object Creation");
+
+    group.bench_function("create_1000_objects", |b| {
+        b.iter(|| {
+            let objects = create_test_objects(1000);
+            black_box(objects)
+        });
+    });
+
+    group.bench_function("create_10000_objects", |b| {
+        b.iter(|| {
+            let objects = create_test_objects(10000);
+            black_box(objects)
+        });
+    });
+
+    group.finish();
+}
+
+fn benchmark_object_tracking(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Object Tracking");
+
+    group.bench_function("track_1000_objects", |b| {
+        b.iter(|| {
+            let mut gc = GarbageCollector::new();
+            let objects = create_test_objects(1000);
+
+            for obj in objects {
+                gc.track(obj).unwrap();
+            }
+
+            black_box(gc.get_count());
+        });
+    });
+
+    group.bench_function("track_10000_objects", |b| {
+        b.iter(|| {
+            let mut gc = GarbageCollector::new();
+            let objects = create_test_objects(10000);
+
+            for obj in objects {
+                gc.track(obj).unwrap();
+            }
+
+            black_box(gc.get_count());
+        });
+    });
+
+    group.finish();
+}
+
+fn benchmark_garbage_collection(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Garbage Collection");
+
+    group.bench_function("collect_empty_gc", |b| {
+        b.iter(|| {
+            let gc = GarbageCollector::new();
+            black_box(gc.collect().unwrap());
+        });
+    });
+
+    group.bench_function("collect_with_1000_objects", |b| {
+        b.iter(|| {
+            let mut gc = GarbageCollector::new();
+            let objects = create_test_objects(1000);
+
+            for obj in objects {
+                gc.track(obj).unwrap();
+            }
+
+            black_box(gc.collect().unwrap());
+        });
+    });
+
+    group.bench_function("collect_with_10000_objects", |b| {
+        b.iter(|| {
+            let mut gc = GarbageCollector::new();
+            let objects = create_test_objects(10000);
+
+            for obj in objects {
+                gc.track(obj).unwrap();
+            }
+
+            black_box(gc.collect().unwrap());
+        });
+    });
+
+    group.finish();
+}
+
+fn benchmark_generation_management(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Generation Management");
+
+    group.bench_function("promote_generations", |b| {
+        b.iter(|| {
+            let mut gc = GarbageCollector::new();
+
+            for i in 0..1000 {
+                let obj = PyObject::new("test".to_string(), ObjectData::Integer(i as i64));
+                gc.track(obj).unwrap();
+
+                if i % 100 == 0 {
+                    gc.collect().unwrap();
+                }
+            }
+
+            black_box(gc.get_stats());
+        });
+    });
+
+    group.finish();
+}
+
+fn benchmark_memory_usage(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Memory Usage");
+
+    group.bench_function("memory_tracking_10000", |b| {
+        b.iter(|| {
+            let mut gc = GarbageCollector::new();
+            let objects = create_test_objects(10000);
+
+            let estimated_memory = objects.len() * std::mem::size_of::<PyObject>();
+
+            for obj in objects {
+                gc.track(obj).unwrap();
+            }
+
+            black_box(estimated_memory);
+        });
+    });
+
+    group.finish();
+}
+
+fn benchmark_concurrent_access(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Concurrent Access");
+
+    group.bench_function("concurrent_tracking", |b| {
+        b.iter(|| {
+            use parking_lot::RwLock;
+            use std::sync::Arc;
+            use std::thread;
+
+            let gc = Arc::new(RwLock::new(GarbageCollector::new()));
+            let mut handles = Vec::new();
+
+            for _ in 0..4 {
+                let gc_clone = gc.clone();
+                let handle = thread::spawn(move || {
+                    for i in 0..100 {
+                        let obj = PyObject::new("test".to_string(), ObjectData::Integer(i));
+                        gc_clone.write().track(obj).unwrap();
+                    }
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            black_box(gc.read().get_count());
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    benchmark_object_creation,
+    benchmark_object_tracking,
+    benchmark_garbage_collection,
+    benchmark_generation_management,
+    benchmark_memory_usage,
+    benchmark_concurrent_access
+);
+
+criterion_main!(benches);
