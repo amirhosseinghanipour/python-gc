@@ -1,5 +1,4 @@
 use crate::GCResult;
-use crate::error::GCError;
 use crate::object::{ObjectId, PyGCHead, PyObject};
 use std::collections::HashMap;
 

@@ -318,7 +318,7 @@ impl Collector {
 
     #[cfg(target_arch = "x86_64")]
     pub fn bulk_collect_objects_simd(&mut self, objects: &[PyObject]) -> usize {
-        use std::arch::x86_64::*;
+        
 
         let mut collected = 0;
         let chunk_size = 8;
