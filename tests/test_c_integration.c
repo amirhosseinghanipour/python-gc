@@ -92,10 +92,10 @@ static void test_gc_object_tracking(void) {
     TEST_ASSERT(result == GC_SUCCESS, "Object tracking should succeed");
     
     tracked = py_gc_is_tracked(obj1);
-    TEST_ASSERT(tracked == 0, "Object should not be tracked (implementation returns 0)");
+    TEST_ASSERT(tracked == 1, "Object should be tracked after tracking");
     
     result = py_gc_track(obj1);
-    TEST_ASSERT(result == GC_SUCCESS, "Double tracking should succeed (creates new objects)");
+    TEST_ASSERT(result == GC_ERROR_ALREADY_TRACKED, "Double tracking should fail with ALREADY_TRACKED");
     
     result = py_gc_track(obj2);
     TEST_ASSERT(result == GC_SUCCESS, "Second object tracking should succeed");
@@ -104,13 +104,13 @@ static void test_gc_object_tracking(void) {
     TEST_ASSERT(result == GC_SUCCESS, "Third object tracking should succeed");
     
     result = py_gc_untrack(obj1);
-    TEST_ASSERT(result == GC_ERROR_NOT_TRACKED, "Object untracking should fail with NOT_TRACKED (dummy implementation)");
+    TEST_ASSERT(result == GC_SUCCESS, "Object untracking should succeed");
     
     tracked = py_gc_is_tracked(obj1);
     TEST_ASSERT(tracked == 0, "Object should not be tracked after untracking");
     
     result = py_gc_untrack(obj1);
-    TEST_ASSERT(result == GC_ERROR_NOT_TRACKED, "Untracking untracked object should fail with NOT_TRACKED (dummy implementation)");
+    TEST_ASSERT(result == GC_ERROR_NOT_TRACKED, "Untracking untracked object should fail with NOT_TRACKED");
     
     destroy_mock_object(obj1);
     destroy_mock_object(obj2);
