@@ -1,7 +1,7 @@
+use crate::GCResult;
 use crate::error::GCError;
 use crate::generation::GenerationManager;
 use crate::object::{ObjectId, PyGCHead, PyObject};
-use crate::GCResult;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +49,20 @@ impl Collector {
         Ok(())
     }
 
+    pub fn track_object_fast(&mut self, mut obj: PyObject) -> GCResult<()> {
+        if obj.gc_tracked {
+            return Err(GCError::AlreadyTracked);
+        }
+
+        obj.gc_tracked = true;
+        obj.gc_head = Some(PyGCHead::new());
+
+        self.generation_manager.add_to_generation0(obj.clone())?;
+        self.tracked_objects.insert(obj.id, obj);
+
+        Ok(())
+    }
+
     pub fn untrack_object(&mut self, obj_id: &ObjectId) -> GCResult<()> {
         let _obj = self
             .tracked_objects
@@ -59,6 +73,19 @@ impl Collector {
             .get_generation_mut(0)
             .ok_or(GCError::Internal("Generation 0 not found".to_string()))?
             .remove_object(obj_id)?;
+
+        Ok(())
+    }
+
+    pub fn untrack_object_fast(&mut self, obj_id: &ObjectId) -> GCResult<()> {
+        let _obj = self
+            .tracked_objects
+            .remove(obj_id)
+            .ok_or(GCError::NotTracked)?;
+
+        if let Some(generation) = self.generation_manager.get_generation_mut(0) {
+            let _ = generation.remove_object(obj_id);
+        }
 
         Ok(())
     }
@@ -168,12 +195,12 @@ impl Collector {
     }
 
     fn move_unreachable(&mut self, generation: usize) -> GCResult<Vec<PyObject>> {
-        let generation_data = self
-            .generation_manager
-            .get_generation(generation)
-            .ok_or(GCError::Internal(format!(
-                "Generation {generation} not found"
-            )))?;
+        let generation_data =
+            self.generation_manager
+                .get_generation(generation)
+                .ok_or(GCError::Internal(format!(
+                    "Generation {generation} not found"
+                )))?;
 
         let mut unreachable = Vec::new();
 
@@ -287,6 +314,53 @@ impl Collector {
 
     pub fn set_debug(&mut self, flags: u32) {
         self.debug_flags = flags;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn bulk_collect_objects_simd(&mut self, objects: &[PyObject]) -> usize {
+        use std::arch::x86_64::*;
+
+        let mut collected = 0;
+        let chunk_size = 8;
+
+        for chunk in objects.chunks(chunk_size) {
+            let mut mask = 0u8;
+
+            for (i, obj) in chunk.iter().enumerate() {
+                if !obj.gc_tracked || obj.get_refcount() == 0 {
+                    mask |= 1 << i;
+                }
+            }
+
+            for (i, obj) in chunk.iter().enumerate() {
+                if (mask & (1 << i)) != 0 {
+                    if let Ok(_) = self.untrack_object_fast(&obj.id) {
+                        collected += 1;
+                    }
+                }
+            }
+        }
+
+        collected
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn bulk_collect_objects_simd(&mut self, objects: &[PyObject]) -> usize {
+        self.bulk_collect_objects_standard(objects)
+    }
+
+    pub fn bulk_collect_objects_standard(&mut self, objects: &[PyObject]) -> usize {
+        let mut collected = 0;
+
+        for obj in objects {
+            if !obj.gc_tracked || obj.get_refcount() == 0 {
+                if let Ok(_) = self.untrack_object_fast(&obj.id) {
+                    collected += 1;
+                }
+            }
+        }
+
+        collected
     }
 }
 

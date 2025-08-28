@@ -1,16 +1,14 @@
+use crate::GCResult;
 use crate::collector::Collector;
 use crate::error::GCError;
 use crate::object::{ObjectId, PyObject};
-use crate::GCResult;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct GarbageCollector {
     collector: Arc<RwLock<Collector>>,
-
     enabled: bool,
-
     thresholds: [usize; 3],
 }
 
@@ -35,22 +33,30 @@ impl GarbageCollector {
         self.enabled
     }
 
+    
     pub fn track(&mut self, obj: PyObject) -> GCResult<()> {
         if !self.enabled {
             return Ok(());
         }
 
-        let mut collector = self.collector.write();
-        collector.track_object(obj)
+        
+        {
+            let mut collector = self.collector.write();
+            collector.track_object_fast(obj)
+        }
     }
 
+    
     pub fn untrack(&mut self, obj_id: &ObjectId) -> GCResult<()> {
         if !self.enabled {
             return Ok(());
         }
 
-        let mut collector = self.collector.write();
-        collector.untrack_object(obj_id)
+        
+        {
+            let mut collector = self.collector.write();
+            collector.untrack_object_fast(obj_id)
+        }
     }
 
     pub fn collect_generation(&self, generation: usize) -> GCResult<usize> {
@@ -68,15 +74,16 @@ impl GarbageCollector {
         }
 
         let mut collector = self.collector.write();
-
         collector.collect_generation(2)
     }
 
+    
     pub fn needs_collection(&self) -> bool {
         let collector = self.collector.read();
         collector.generation_manager.needs_collection().is_some()
     }
 
+    
     pub fn get_stats(&self) -> crate::collector::GCStats {
         let collector = self.collector.read();
         collector.get_stats()
@@ -87,11 +94,13 @@ impl GarbageCollector {
         collector.set_debug(flags);
     }
 
+    
     pub fn get_count(&self) -> usize {
         let collector = self.collector.read();
         collector.get_stats().total_tracked
     }
 
+    
     pub fn get_generation_count(&self, generation: usize) -> Option<usize> {
         if generation >= 3 {
             return None;

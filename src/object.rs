@@ -1,7 +1,6 @@
-use parking_lot::RwLock;
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId(usize);
@@ -108,21 +107,23 @@ pub enum ObjectData {
     None,
 }
 
+
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub struct PyObject {
+    
     pub id: ObjectId,
-
-    pub type_name: String,
-
-    pub data: Arc<RwLock<ObjectData>>,
-
+    pub gc_tracked: bool,
+    pub has_finalizer: bool,
     pub refcount: Arc<AtomicUsize>,
 
-    pub gc_tracked: bool,
-
+    
     pub gc_head: Option<PyGCHead>,
 
-    pub has_finalizer: bool,
+    
+    pub type_name: String,
+    pub data: Arc<RwLock<ObjectData>>,
+    pub original_ptr: Option<*mut std::ffi::c_void>,
 }
 
 impl PyObject {
@@ -135,6 +136,21 @@ impl PyObject {
             gc_tracked: false,
             gc_head: None,
             has_finalizer: false,
+            original_ptr: None,
+        }
+    }
+
+    
+    pub fn new_ffi(type_name: &str, data: ObjectData, ptr: *mut std::ffi::c_void) -> Self {
+        Self {
+            id: ObjectId::new(),
+            type_name: type_name.to_string(),
+            data: Arc::new(RwLock::new(data)),
+            refcount: Arc::new(AtomicUsize::new(1)),
+            gc_tracked: false,
+            gc_head: None,
+            has_finalizer: false,
+            original_ptr: Some(ptr),
         }
     }
 
@@ -147,6 +163,20 @@ impl PyObject {
             gc_tracked: false,
             gc_head: None,
             has_finalizer: true,
+            original_ptr: None,
+        }
+    }
+
+    pub fn new_with_ptr(type_name: String, data: ObjectData, ptr: *mut std::ffi::c_void) -> Self {
+        Self {
+            id: ObjectId::new(),
+            type_name,
+            data: Arc::new(RwLock::new(data)),
+            refcount: Arc::new(AtomicUsize::new(1)),
+            gc_tracked: false,
+            gc_head: None,
+            has_finalizer: false,
+            original_ptr: Some(ptr),
         }
     }
 
@@ -175,6 +205,12 @@ impl PyObject {
                 | ObjectData::Set(_)
                 | ObjectData::Custom(_)
         )
+    }
+
+    pub fn matches_ptr(&self, ptr: *mut std::ffi::c_void) -> bool {
+        self.original_ptr
+            .map(|orig_ptr| orig_ptr == ptr)
+            .unwrap_or(false)
     }
 
     pub fn get_size(&self) -> usize {
@@ -240,7 +276,7 @@ impl PyObjectPtr {
         if self.ptr.is_null() {
             None
         } else {
-            Some(&*self.ptr)
+            unsafe { Some(&*self.ptr) }
         }
     }
 
@@ -254,7 +290,7 @@ impl PyObjectPtr {
         if self.ptr.is_null() {
             None
         } else {
-            Some(&mut *self.ptr)
+            unsafe { Some(&mut *self.ptr) }
         }
     }
 

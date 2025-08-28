@@ -1,22 +1,19 @@
-use crate::object::{ObjectId, PyGCHead, PyObject};
 use crate::GCResult;
+use crate::error::GCError;
+use crate::object::{ObjectId, PyGCHead, PyObject};
 use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct Generation {
     pub head: PyGCHead,
-
     pub threshold: usize,
-
     pub count: usize,
-
     pub objects: HashMap<ObjectId, PyObject>,
 }
 
 impl Generation {
     pub fn new(threshold: usize) -> Self {
         let mut head = PyGCHead::new();
-
         head._gc_next = &head as *const _ as usize;
         head._gc_prev = &head as *const _ as usize;
 
@@ -40,7 +37,6 @@ impl Generation {
         }
 
         self.insert_into_list(&obj);
-
         self.objects.insert(obj_id, obj);
         self.count += 1;
 
@@ -54,7 +50,6 @@ impl Generation {
             .ok_or(crate::error::GCError::NotTracked)?;
 
         self.remove_from_list(&obj);
-
         self.count -= 1;
         Ok(obj)
     }
@@ -89,9 +84,7 @@ impl Generation {
 #[derive(Debug)]
 pub struct GenerationManager {
     pub generations: [Generation; 3],
-
     pub permanent_generation: Generation,
-
     pub collecting_generation: Option<usize>,
 }
 
@@ -118,6 +111,21 @@ impl GenerationManager {
 
     pub fn add_to_generation0(&mut self, obj: PyObject) -> GCResult<()> {
         self.generations[0].add_object(obj)
+    }
+
+    
+    pub fn bulk_add_to_generation0(&mut self, objects: Vec<PyObject>) -> GCResult<()> {
+        let generation = &mut self.generations[0];
+
+        
+        for obj in objects {
+            if !generation.objects.contains_key(&obj.id) {
+                generation.objects.insert(obj.id, obj);
+                generation.count += 1;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn promote_generation(&mut self, from_gen: usize) -> GCResult<()> {

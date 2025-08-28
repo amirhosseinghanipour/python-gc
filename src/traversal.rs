@@ -1,6 +1,6 @@
+use crate::GCResult;
 use crate::error::GCError;
 use crate::object::{ObjectId, PyObject};
-use crate::GCResult;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone)]
