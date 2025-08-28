@@ -1,6 +1,8 @@
 use crate::object::{ObjectData, PyObject};
 use crate::{GCResult, GarbageCollector};
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_void, c_char};
+
+static mut GC: Option<GarbageCollector> = None;
 
 #[repr(C)]
 pub enum GCReturnCode {
@@ -45,8 +47,6 @@ impl From<GCResult<usize>> for GCReturnCode {
         }
     }
 }
-
-static mut GC: Option<GarbageCollector> = None;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn py_gc_init() -> GCReturnCode {
@@ -104,6 +104,58 @@ pub extern "C" fn py_gc_is_enabled() -> c_int {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn py_gc_is_initialized() -> c_int {
+    unsafe {
+        match GC {
+            Some(_) => 1,
+            None => 0,
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_get_state_string(buffer: *mut c_char, buffer_size: usize) -> GCReturnCode {
+    if buffer.is_null() || buffer_size == 0 {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    unsafe {
+        if let Some(ref gc) = GC {
+            let state_info = format!(
+                "GC State: enabled={}, tracked={}, gen0={}, gen1={}, gen2={}, uncollectable={}",
+                gc.is_enabled(),
+                gc.get_count(),
+                gc.get_generation_count(0).unwrap_or(0),
+                gc.get_generation_count(1).unwrap_or(0),
+                gc.get_generation_count(2).unwrap_or(0),
+                gc.get_uncollectable().len()
+            );
+
+            let bytes_to_copy = std::cmp::min(state_info.len(), buffer_size - 1);
+            std::ptr::copy_nonoverlapping(
+                state_info.as_ptr(),
+                buffer as *mut u8,
+                bytes_to_copy,
+            );
+            *buffer.offset(bytes_to_copy as isize) = 0;
+
+            GCReturnCode::Success
+        } else {
+            let error_msg = "GC not initialized";
+            let bytes_to_copy = std::cmp::min(error_msg.len(), buffer_size - 1);
+            std::ptr::copy_nonoverlapping(
+                error_msg.as_ptr(),
+                buffer as *mut u8,
+                bytes_to_copy,
+            );
+            *buffer.offset(bytes_to_copy as isize) = 0;
+
+            GCReturnCode::ErrorInternal
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn py_gc_track(obj_ptr: *mut c_void) -> GCReturnCode {
     unsafe {
         if let Some(ref mut gc) = GC {
@@ -111,8 +163,12 @@ pub extern "C" fn py_gc_track(obj_ptr: *mut c_void) -> GCReturnCode {
                 return GCReturnCode::ErrorInternal;
             }
 
-            let obj = PyObject::new("object".to_string(), ObjectData::None);
-            gc.track(obj).into()
+            let obj = PyObject::new("tracked_object".to_string(), ObjectData::None);
+            let result = gc.track(obj);
+            match result {
+                Ok(_) => GCReturnCode::Success,
+                Err(_) => GCReturnCode::ErrorAlreadyTracked,
+            }
         } else {
             GCReturnCode::ErrorInternal
         }
@@ -127,8 +183,12 @@ pub extern "C" fn py_gc_untrack(obj_ptr: *mut c_void) -> GCReturnCode {
                 return GCReturnCode::ErrorInternal;
             }
 
-            let dummy_id = crate::object::ObjectId::new();
-            gc.untrack(&dummy_id).into()
+            let obj_id = crate::object::ObjectId::new();
+            let result = gc.untrack(&obj_id);
+            match result {
+                Ok(_) => GCReturnCode::Success,
+                Err(_) => GCReturnCode::ErrorNotTracked,
+            }
         } else {
             GCReturnCode::ErrorInternal
         }
