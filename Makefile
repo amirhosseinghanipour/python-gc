@@ -12,6 +12,9 @@ build-rust:
 test_c_integration: tests/test_c_integration.c
 	$(CC) $(CFLAGS) -o test_c_integration tests/test_c_integration.c $(LDFLAGS)
 
+test_production_features: tests/test_production_features.c
+	$(CC) $(CFLAGS) -o test_production_features tests/test_production_features.c $(LDFLAGS)
+
 test: test_c_integration
 	./test_c_integration
 
