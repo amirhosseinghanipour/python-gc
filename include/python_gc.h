@@ -162,6 +162,39 @@ int32_t py_gc_get_uncollectable_count(void);
  */
 gc_return_code_t py_gc_clear_uncollectable(void);
 
+/**
+ * Get the count of tracked objects in the registry
+ * @return Number of tracked objects in the registry
+ */
+int32_t py_gc_get_registry_count(void);
+
+/**
+ * Clear the entire object registry
+ * @return GC_SUCCESS on success, error code on failure
+ */
+gc_return_code_t py_gc_clear_registry(void);
+
+/**
+ * Get detailed information about a tracked object
+ * @param obj_ptr Pointer to the tracked object
+ * @param buffer Buffer to store the object information
+ * @param buffer_size Size of the buffer
+ * @return GC_SUCCESS on success, error code on failure
+ */
+gc_return_code_t py_gc_get_tracked_info(void* obj_ptr, char* buffer, size_t buffer_size);
+
+/**
+ * Debug untrack function with detailed error reporting
+ * @param obj_ptr Pointer to the tracked object
+ * @return GC_SUCCESS on success, error code on failure
+ */
+gc_return_code_t py_gc_debug_untrack(void* obj_ptr);
+
+/**
+ * Debug function to print GC internal state
+ * @return GC_SUCCESS on success, error code on failure
+ */
+gc_return_code_t py_gc_debug_state(void);
 
 
 /**
