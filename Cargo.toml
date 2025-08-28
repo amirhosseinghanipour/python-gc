@@ -1,0 +1,19 @@
+[package]
+name = "python_gc"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "python_gc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crossbeam = "0.8"
+parking_lot = "0.12"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+memoffset = "0.9"
+
+[dev-dependencies]
+criterion = "0.5" 
