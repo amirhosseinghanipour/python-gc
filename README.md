@@ -5,9 +5,10 @@
 This is an attempt on Python's three-generation garbage collection model, written in pure Rust with all the memory safety guarantees you'd expect from a proper systems language.
 
 The current implementation provides a solid foundation for Python garbage collection in Rust. Planned improvements include:
-- Enhanced cycle detection algorithms
-- Parallel collection capabilities
-- Integration testing with actual CPython builds
+- Lock-free data structures
+- Memory pool
+- JIT compilation
+- NUMA-Aware allocation
 
 Performance optimization will focus on reducing collection overhead and improving memory locality. The modular design allows for incremental improvements without affecting the core architecture or C API compatibility.
 
