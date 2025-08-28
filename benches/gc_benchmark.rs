@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use python_gc::{object::ObjectData, GarbageCollector, PyObject};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use python_gc::{GarbageCollector, PyObject, object::ObjectData};
 
 fn create_test_objects(count: usize) -> Vec<PyObject> {
     (0..count)
@@ -150,48 +150,13 @@ fn benchmark_memory_usage(c: &mut Criterion) {
     group.finish();
 }
 
-fn benchmark_concurrent_access(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Concurrent Access");
-
-    group.bench_function("concurrent_tracking", |b| {
-        b.iter(|| {
-            use parking_lot::RwLock;
-            use std::sync::Arc;
-            use std::thread;
-
-            let gc = Arc::new(RwLock::new(GarbageCollector::new()));
-            let mut handles = Vec::new();
-
-            for _ in 0..4 {
-                let gc_clone = gc.clone();
-                let handle = thread::spawn(move || {
-                    for i in 0..100 {
-                        let obj = PyObject::new("test".to_string(), ObjectData::Integer(i));
-                        gc_clone.write().track(obj).unwrap();
-                    }
-                });
-                handles.push(handle);
-            }
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
-
-            black_box(gc.read().get_count());
-        });
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     benchmark_object_creation,
     benchmark_object_tracking,
     benchmark_garbage_collection,
     benchmark_generation_management,
-    benchmark_memory_usage,
-    benchmark_concurrent_access
+    benchmark_memory_usage
 );
 
 criterion_main!(benches);
