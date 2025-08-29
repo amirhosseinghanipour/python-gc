@@ -12,7 +12,7 @@ fn create_test_objects(count: usize) -> Vec<PyObject> {
             match name_idx {
                 0 => PyObject::new(name.to_string(), ObjectData::List(Vec::new())),
                 1 => PyObject::new(name.to_string(), ObjectData::Dict(Vec::new())),
-                _ => PyObject::new(name.to_string(), ObjectData::Set(Vec::new())),
+                _ => PyObject::new(name.to_string(), ObjectData::List(Vec::new())),
             }
         })
         .collect()
