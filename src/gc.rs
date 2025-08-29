@@ -13,6 +13,9 @@ pub struct GarbageCollector {
     debug_flags: u32,
 }
 
+unsafe impl Send for GarbageCollector {}
+unsafe impl Sync for GarbageCollector {}
+
 impl GarbageCollector {
     pub fn new() -> Self {
         Self {

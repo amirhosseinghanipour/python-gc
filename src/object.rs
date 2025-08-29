@@ -119,6 +119,9 @@ pub enum ObjectData {
     None,
 }
 
+unsafe impl Send for ObjectData {}
+unsafe impl Sync for ObjectData {}
+
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct PyObject {
@@ -130,6 +133,9 @@ pub struct PyObject {
     pub has_finalizer: bool,
     pub id: ObjectId,
 }
+
+unsafe impl Send for PyObject {}
+unsafe impl Sync for PyObject {}
 
 impl PyObject {
     pub fn new(name: String, data: ObjectData) -> Self {

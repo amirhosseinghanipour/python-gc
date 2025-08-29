@@ -20,6 +20,9 @@ pub struct Collector {
     pub debug_flags: u32,
 }
 
+unsafe impl Send for Collector {}
+unsafe impl Sync for Collector {}
+
 impl Default for Collector {
     fn default() -> Self {
         Self::new()
