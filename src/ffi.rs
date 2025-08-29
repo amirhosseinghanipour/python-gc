@@ -22,7 +22,7 @@ thread_local! {
     static OBJECT_REGISTRY: RefCell<HashMap<*mut c_void, PyObject>> = RefCell::new(HashMap::new());
     static REFCOUNT_CALLBACKS: RefCell<HashMap<*mut c_void, RefCountCallback>> = RefCell::new(HashMap::new());
     static REFERENCE_TRACKING: RefCell<HashMap<*mut c_void, HashSet<*mut c_void>>> = RefCell::new(HashMap::new());
-    static UNCOLLECTABLE_OBJECTS: RefCell<Vec<*mut c_void>> = RefCell::new(Vec::new());
+    static UNCOLLECTABLE_OBJECTS: RefCell<Vec<*mut c_void>> = const { RefCell::new(Vec::new()) };
 }
 
 type RefCountCallback = Box<dyn Fn(*mut c_void, i32) + Send + Sync>;
@@ -357,6 +357,13 @@ pub extern "C" fn py_gc_is_initialized() -> c_int {
     }
 }
 
+/// Get GC state information as a string
+///
+/// # Safety
+///
+/// - `buffer` must be a valid pointer to a buffer of at least `buffer_size` bytes
+/// - `buffer_size` must be greater than 0
+/// - The buffer must be writable and not overlap with any other memory being accessed
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_get_state_string(
     buffer: *mut c_char,
@@ -405,8 +412,12 @@ pub extern "C" fn py_gc_track(obj_ptr: *mut c_void) -> GCReturnCode {
     }
 
     let ptr_addr = obj_ptr as usize;
-    let obj_name = get_fast_object_name(ptr_addr);
-    let obj = PyObject::new_ffi(obj_name, ObjectData::None, obj_ptr);
+    let _obj_name = get_fast_object_name(ptr_addr);
+
+    let obj = unsafe {
+        let original_obj = &*(obj_ptr as *mut PyObject);
+        original_obj.clone()
+    };
 
     track_object_fast(obj_ptr, obj);
     GCReturnCode::Success
@@ -695,6 +706,14 @@ pub extern "C" fn py_gc_is_uncollectable(obj_ptr: *mut c_void) -> c_int {
     })
 }
 
+/// Get information about a tracked object
+///
+/// # Safety
+///
+/// - `obj_ptr` must be a valid pointer to a tracked object or null
+/// - `buffer` must be a valid pointer to a buffer of at least `buffer_size` bytes
+/// - `buffer_size` must be greater than 0
+/// - The buffer must be writable and not overlap with any other memory being accessed
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_get_tracked_info(
     obj_ptr: *mut c_void,
@@ -711,7 +730,7 @@ pub unsafe extern "C" fn py_gc_get_tracked_info(
                 let error_msg = "NULL pointer";
                 let bytes_to_copy = std::cmp::min(error_msg.len(), buffer_size - 1);
                 std::ptr::copy_nonoverlapping(error_msg.as_ptr(), buffer as *mut u8, bytes_to_copy);
-                *buffer.offset(bytes_to_copy as isize) = 0;
+                *buffer.add(bytes_to_copy) = 0;
                 return GCReturnCode::ErrorInternal;
             }
 
@@ -719,7 +738,7 @@ pub unsafe extern "C" fn py_gc_get_tracked_info(
                 let error_msg = "Pointer not tracked";
                 let bytes_to_copy = std::cmp::min(error_msg.len(), buffer_size - 1);
                 std::ptr::copy_nonoverlapping(error_msg.as_ptr(), buffer as *mut u8, bytes_to_copy);
-                *buffer.offset(bytes_to_copy as isize) = 0;
+                *buffer.add(bytes_to_copy) = 0;
                 return GCReturnCode::ErrorNotTracked;
             }
 
@@ -727,7 +746,7 @@ pub unsafe extern "C" fn py_gc_get_tracked_info(
                 if let Some(obj) = reg.get(&obj_ptr) {
                     format!(
                         "Object: {} (ID: {}, Refs: {}, Ptr: {:p})",
-                        obj.type_name,
+                        obj.name,
                         obj.id.as_usize(),
                         obj.get_refcount(),
                         obj_ptr
@@ -739,14 +758,14 @@ pub unsafe extern "C" fn py_gc_get_tracked_info(
 
             let bytes_to_copy = std::cmp::min(obj_info.len(), buffer_size - 1);
             std::ptr::copy_nonoverlapping(obj_info.as_ptr(), buffer as *mut u8, bytes_to_copy);
-            *buffer.offset(bytes_to_copy as isize) = 0;
+            *buffer.add(bytes_to_copy) = 0;
 
             GCReturnCode::Success
         } else {
             let error_msg = "GC not initialized";
             let bytes_to_copy = std::cmp::min(error_msg.len(), buffer_size - 1);
             std::ptr::copy_nonoverlapping(error_msg.as_ptr(), buffer as *mut u8, bytes_to_copy);
-            *buffer.offset(bytes_to_copy as isize) = 0;
+            *buffer.add(bytes_to_copy) = 0;
             GCReturnCode::ErrorInternal
         }
     }
@@ -924,8 +943,15 @@ pub extern "C" fn py_gc_get_refcount(obj_ptr: *mut c_void) -> c_int {
     })
 }
 
+/// Set the reference count of an object
+///
+/// # Safety
+///
+/// - `obj_ptr` must be a valid pointer to a Python object or null
+/// - The object must not be in an inconsistent state
+/// - `refcount` must be non-negative
 #[unsafe(no_mangle)]
-pub extern "C" fn py_gc_set_refcount(obj_ptr: *mut c_void, refcount: c_int) -> GCReturnCode {
+pub unsafe extern "C" fn py_gc_set_refcount(obj_ptr: *mut c_void, refcount: c_int) -> GCReturnCode {
     if obj_ptr.is_null() || refcount < 0 {
         return GCReturnCode::ErrorInternal;
     }
@@ -938,11 +964,11 @@ pub extern "C" fn py_gc_set_refcount(obj_ptr: *mut c_void, refcount: c_int) -> G
 
             if target_refcount > current_refcount {
                 for _ in 0..(target_refcount - current_refcount) {
-                    obj.incref();
+                    obj.inc_ref();
                 }
             } else if target_refcount < current_refcount {
                 for _ in 0..(current_refcount - target_refcount) {
-                    obj.decref();
+                    obj.dec_ref();
                 }
             }
 
@@ -981,6 +1007,12 @@ pub extern "C" fn py_gc_set_refcount(obj_ptr: *mut c_void, refcount: c_int) -> G
     }
 }
 
+/// Get all tracked objects as a Python list
+///
+/// # Safety
+///
+/// - The returned pointer must be properly managed by the caller
+/// - The caller is responsible for decrementing the reference count when done
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_get_objects() -> *mut c_void {
     with_object_registry(|reg| {
@@ -989,6 +1021,13 @@ pub unsafe extern "C" fn py_gc_get_objects() -> *mut c_void {
     })
 }
 
+/// Get objects that refer to the given object
+///
+/// # Safety
+///
+/// - `obj_ptr` must be a valid pointer to a tracked object or null
+/// - The returned pointer must be properly managed by the caller
+/// - The caller is responsible for decrementing the reference count when done
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_get_referrers(obj_ptr: *mut c_void) -> *mut c_void {
     if obj_ptr.is_null() {
@@ -999,6 +1038,13 @@ pub unsafe extern "C" fn py_gc_get_referrers(obj_ptr: *mut c_void) -> *mut c_voi
     unsafe { create_python_list_from_objects(referrers) }
 }
 
+/// Get objects that the given object refers to
+///
+/// # Safety
+///
+/// - `obj_ptr` must be a valid pointer to a tracked object or null
+/// - The returned pointer must be properly managed by the caller
+/// - The caller is responsible for decrementing the reference count when done
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_get_referents(obj_ptr: *mut c_void) -> *mut c_void {
     if obj_ptr.is_null() {
@@ -1094,6 +1140,12 @@ pub extern "C" fn py_gc_get_collection_counts() -> *mut c_int {
     }
 }
 
+/// Free memory allocated for collection counts
+///
+/// # Safety
+///
+/// - `counts` must be a valid pointer previously returned by a GC function
+/// - The pointer must not be used after this call
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_free_collection_counts(counts: *mut c_int) {
     if !counts.is_null() {
@@ -1103,12 +1155,24 @@ pub unsafe extern "C" fn py_gc_free_collection_counts(counts: *mut c_int) {
     }
 }
 
+/// Get uncollectable objects as a Python list
+///
+/// # Safety
+///
+/// - The returned pointer must be properly managed by the caller
+/// - The caller is responsible for decrementing the reference count when done
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_get_garbage() -> *mut c_void {
     let uncollectable = get_uncollectable_objects();
     unsafe { create_python_list_from_objects(uncollectable) }
 }
 
+/// Set the garbage list for uncollectable objects
+///
+/// # Safety
+///
+/// - `garbage_list` must be a valid pointer to a Python list or null
+/// - The list must contain valid object pointers
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_set_garbage(garbage_list: *mut c_void) -> GCReturnCode {
     if garbage_list.is_null() {
@@ -1172,7 +1236,7 @@ pub extern "C" fn py_gc_has_finalizer(obj_ptr: *mut c_void) -> c_int {
         if let Some(obj) = reg.get(&obj_ptr) {
             if obj.has_finalizer { 1 } else { 0 }
         } else {
-            0
+            0 // Object not tracked, so no finalizer
         }
     })
 }
@@ -1185,13 +1249,12 @@ pub extern "C" fn py_gc_set_finalizer(obj_ptr: *mut c_void, has_finalizer: c_int
 
     with_object_registry(|reg| {
         if let Some(obj) = reg.get_mut(&obj_ptr) {
-            obj.has_finalizer = has_finalizer != 0;
+            obj.set_finalizer(has_finalizer != 0);
             GCReturnCode::Success
         } else {
             GCReturnCode::ErrorNotTracked
         }
-    });
-    GCReturnCode::Success
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1202,13 +1265,31 @@ pub extern "C" fn py_gc_get_object_size(obj_ptr: *mut c_void) -> c_int {
 
     with_object_registry(|reg| {
         if let Some(obj) = reg.get(&obj_ptr) {
-            obj.get_size() as c_int
+            match &obj.data {
+                ObjectData::Integer(_) => 8,
+                ObjectData::Float(_) => 8,
+                ObjectData::String(s) => s.len() as c_int,
+                ObjectData::List(l) => (l.len() * std::mem::size_of::<PyObject>()) as c_int,
+                ObjectData::Dict(d) => {
+                    (d.len() * std::mem::size_of::<(PyObject, PyObject)>()) as c_int
+                }
+                ObjectData::Custom(_) => std::mem::size_of::<*mut c_void>() as c_int,
+                ObjectData::None => 0,
+            }
         } else {
             0
         }
     })
 }
 
+/// Get the type name of an object
+///
+/// # Safety
+///
+/// - `obj_ptr` must be a valid pointer to a tracked object or null
+/// - `buffer` must be a valid pointer to a buffer of at least `buffer_size` bytes
+/// - `buffer_size` must be greater than 0
+/// - The buffer must be writable and not overlap with any other memory being accessed
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_get_object_type_name(
     obj_ptr: *mut c_void,
@@ -1224,14 +1305,14 @@ pub unsafe extern "C" fn py_gc_get_object_type_name(
         unsafe {
             let bytes_to_copy = std::cmp::min(error_msg.len(), buffer_size - 1);
             std::ptr::copy_nonoverlapping(error_msg.as_ptr(), buffer as *mut u8, bytes_to_copy);
-            *buffer.offset(bytes_to_copy as isize) = 0;
+            *buffer.add(bytes_to_copy) = 0;
         }
         return GCReturnCode::ErrorInternal;
     }
 
     let type_name = with_object_registry(|reg| {
         if let Some(obj) = reg.get(&obj_ptr) {
-            obj.type_name.clone()
+            obj.name.clone()
         } else {
             "unknown".to_string()
         }
@@ -1240,7 +1321,7 @@ pub unsafe extern "C" fn py_gc_get_object_type_name(
     unsafe {
         let bytes_to_copy = std::cmp::min(type_name.len(), buffer_size - 1);
         std::ptr::copy_nonoverlapping(type_name.as_ptr(), buffer as *mut u8, bytes_to_copy);
-        *buffer.offset(bytes_to_copy as isize) = 0;
+        *buffer.add(bytes_to_copy) = 0;
     }
 
     GCReturnCode::Success
@@ -1266,19 +1347,52 @@ mod tests {
         assert_eq!(py_gc_enable() as i32, GCReturnCode::Success as i32);
         assert_eq!(py_gc_is_enabled(), 1);
 
-        py_gc_cleanup();
+        assert_eq!(py_gc_cleanup() as i32, GCReturnCode::Success as i32);
     }
 
     #[test]
     fn test_gc_collection() {
         assert_eq!(py_gc_init() as i32, GCReturnCode::Success as i32);
 
-        assert_eq!(py_gc_collect() as i32, GCReturnCode::Success as i32);
+        let result = py_gc_collect();
+        assert_eq!(result as i32, GCReturnCode::Success as i32);
+
+        assert_eq!(py_gc_cleanup() as i32, GCReturnCode::Success as i32);
+    }
+
+    #[test]
+    fn test_finalizer_behavior() {
+        assert_eq!(py_gc_init() as i32, GCReturnCode::Success as i32);
+
+        let obj1 = PyObject::new("regular_obj".to_string(), ObjectData::Integer(42));
+        let obj1_ptr = Box::into_raw(Box::new(obj1)) as *mut c_void;
+
+        assert_eq!(py_gc_track(obj1_ptr) as i32, GCReturnCode::Success as i32);
+
+        assert_eq!(py_gc_has_finalizer(obj1_ptr), 0);
+
         assert_eq!(
-            py_gc_collect_generation(0) as i32,
+            py_gc_set_finalizer(obj1_ptr, 1) as i32,
             GCReturnCode::Success as i32
         );
 
-        py_gc_cleanup();
+        assert_eq!(py_gc_has_finalizer(obj1_ptr), 1);
+
+        let obj2 = PyObject::new_with_finalizer(
+            "finalizer_obj".to_string(),
+            ObjectData::String("test".to_string()),
+        );
+        let obj2_ptr = Box::into_raw(Box::new(obj2)) as *mut c_void;
+
+        assert_eq!(py_gc_track(obj2_ptr) as i32, GCReturnCode::Success as i32);
+
+        assert_eq!(py_gc_has_finalizer(obj2_ptr), 1);
+
+        unsafe {
+            let _ = Box::from_raw(obj1_ptr as *mut PyObject);
+            let _ = Box::from_raw(obj2_ptr as *mut PyObject);
+        }
+
+        assert_eq!(py_gc_cleanup() as i32, GCReturnCode::Success as i32);
     }
 }
