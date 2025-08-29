@@ -12,6 +12,15 @@ pub mod generation;
 pub mod object;
 pub mod traversal;
 
+#[derive(Debug, Clone)]
+pub struct GCStats {
+    pub collections: usize,
+    pub collected: usize,
+    pub uncollectable: usize,
+    pub total_tracked: usize,
+    pub generation_counts: [usize; 3],
+}
+
 pub use error::GCError;
 pub use gc::GarbageCollector;
 pub use object::{ObjectId, PyGCHead, PyObject};
