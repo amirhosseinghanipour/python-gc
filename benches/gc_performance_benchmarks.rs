@@ -3,12 +3,12 @@ use python_gc::{GarbageCollector, PyObject, object::ObjectData};
 
 fn create_test_objects(count: usize) -> Vec<PyObject> {
     static NAMES: [&str; 3] = ["list", "dict", "set"];
-    
+
     (0..count)
         .map(|i| {
             let name_idx = i % 3;
             let name = NAMES[name_idx];
-            
+
             match name_idx {
                 0 => PyObject::new(name.to_string(), ObjectData::List(Vec::new())),
                 1 => PyObject::new(name.to_string(), ObjectData::Dict(Vec::new())),
@@ -181,9 +181,13 @@ fn benchmark_python_object_tracking(c: &mut Criterion) {
     group.bench_function("track_10000_python_objects", |b| {
         b.iter(|| {
             let mut gc = GarbageCollector::new();
-            
+
             for i in 0..10000 {
-                let obj = PyObject::new_ffi("python_obj", ObjectData::Integer(i as i64), std::ptr::null_mut());
+                let obj = PyObject::new_ffi(
+                    "python_obj",
+                    ObjectData::Integer(i as i64),
+                    std::ptr::null_mut(),
+                );
                 gc.track(obj).unwrap();
             }
 
@@ -194,9 +198,13 @@ fn benchmark_python_object_tracking(c: &mut Criterion) {
     group.bench_function("collect_10000_python_objects", |b| {
         b.iter(|| {
             let mut gc = GarbageCollector::new();
-            
+
             for i in 0..10000 {
-                let obj = PyObject::new_ffi("python_obj", ObjectData::Integer(i as i64), std::ptr::null_mut());
+                let obj = PyObject::new_ffi(
+                    "python_obj",
+                    ObjectData::Integer(i as i64),
+                    std::ptr::null_mut(),
+                );
                 gc.track(obj).unwrap();
             }
 

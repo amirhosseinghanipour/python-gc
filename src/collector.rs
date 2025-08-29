@@ -73,9 +73,9 @@ impl Collector {
                 count += 1;
             }
         }
-        
+
         self.generation_manager.generations[0].count += count;
-        
+
         Ok(())
     }
 
@@ -144,12 +144,12 @@ impl Collector {
     fn collect_fast(&mut self, _generation: usize) -> GCResult<usize> {
         let count = self.tracked_objects.len();
         self.tracked_objects.clear();
-        
+
         for generation in &mut self.generation_manager.generations {
             generation.count = 0;
             generation.objects.clear();
         }
-        
+
         Ok(count)
     }
 
