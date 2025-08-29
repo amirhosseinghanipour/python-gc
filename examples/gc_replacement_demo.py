@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-Python GC Replacement Module
-
-This module provides a complete replacement for Python's built-in gc module,
-using the Rust garbage collector implementation.
-
-Usage:
-    import python_gc_replacement as gc
-    # Use exactly like Python's built-in gc module
-"""
-
 import ctypes
 import sys
 import os
