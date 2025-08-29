@@ -88,10 +88,10 @@ impl GarbageCollector {
 
     pub fn needs_collection(&self) -> bool {
         let collector = self.collector.read();
-        collector.generation_manager.needs_collection().is_some()
+        collector.generation_manager.should_collect_generation(0)
     }
 
-    pub fn get_stats(&self) -> crate::collector::GCStats {
+    pub fn get_stats(&self) -> crate::GCStats {
         let collector = self.collector.read();
         collector.get_stats()
     }
@@ -99,7 +99,7 @@ impl GarbageCollector {
     pub fn set_debug(&mut self, flags: u32) {
         self.debug_flags = flags;
         let mut collector = self.collector.write();
-        collector.set_debug(flags);
+        collector.set_debug_flags(flags);
     }
 
     pub fn get_debug(&self) -> u32 {
@@ -108,7 +108,7 @@ impl GarbageCollector {
 
     pub fn get_count(&self) -> usize {
         let collector = self.collector.read();
-        collector.get_stats().total_tracked
+        collector.get_count()
     }
 
     pub fn get_generation_count(&self, generation: usize) -> Option<usize> {
@@ -117,8 +117,10 @@ impl GarbageCollector {
         }
 
         let collector = self.collector.read();
-        let stats = collector.get_stats();
-        Some(stats.generation_counts[generation])
+        collector
+            .generation_manager
+            .get_generation(generation)
+            .map(|g| g.count)
     }
 
     pub fn set_threshold(&mut self, generation: usize, threshold: usize) -> GCResult<()> {
@@ -214,7 +216,7 @@ pub mod global {
         gc.collect()
     }
 
-    pub fn get_stats() -> crate::collector::GCStats {
+    pub fn get_stats() -> crate::GCStats {
         let binding = get_gc();
         let gc = binding.read();
         gc.get_stats()
