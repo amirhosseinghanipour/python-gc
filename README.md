@@ -21,12 +21,10 @@ I'd like to explore lock-free data structures, pool-based memory allocation, and
 ## Performance Optimizations
 
 ### **Benchmark Improvements**
-- **Object Creation**: 68-80% faster
-- **Object Tracking**: 17-43% faster (bulk operations: 34-43% improvement)
-- **Garbage Collection**: 22-39% faster
-- **Generation Management**: 45-58% faster
-- **Memory Usage**: 38-46% faster
-- **Python Object Tracking**: 50-55% faster
+- **Creation**: 0.0443s
+- **Tracking**: 0.0374s
+- **Collection**: 0.0000s
+- **Untracking**: 0.0375s
 
 ### **Key Optimizations**
 - **Memory Layout**: CPython-style GC headers before objects for better cache locality
