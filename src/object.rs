@@ -107,20 +107,16 @@ pub enum ObjectData {
     None,
 }
 
-
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct PyObject {
-    
     pub id: ObjectId,
     pub gc_tracked: bool,
     pub has_finalizer: bool,
     pub refcount: Arc<AtomicUsize>,
 
-    
     pub gc_head: Option<PyGCHead>,
 
-    
     pub type_name: String,
     pub data: Arc<RwLock<ObjectData>>,
     pub original_ptr: Option<*mut std::ffi::c_void>,
@@ -140,7 +136,6 @@ impl PyObject {
         }
     }
 
-    
     pub fn new_ffi(type_name: &str, data: ObjectData, ptr: *mut std::ffi::c_void) -> Self {
         Self {
             id: ObjectId::new(),

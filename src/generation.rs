@@ -112,11 +112,14 @@ impl GenerationManager {
         self.generations[0].add_object(obj)
     }
 
-    
+    pub fn add_to_generation0_fast(&mut self, _obj_id: ObjectId) -> GCResult<()> {
+        self.generations[0].count += 1;
+        Ok(())
+    }
+
     pub fn bulk_add_to_generation0(&mut self, objects: Vec<PyObject>) -> GCResult<()> {
         let generation = &mut self.generations[0];
 
-        
         for obj in objects {
             if !generation.objects.contains_key(&obj.id) {
                 generation.objects.insert(obj.id, obj);

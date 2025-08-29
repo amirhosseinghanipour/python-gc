@@ -2,15 +2,94 @@ use crate::object::{ObjectData, PyObject};
 use crate::{GCResult, GarbageCollector};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_void};
+use std::collections::HashSet;
+use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+unsafe extern "C" {
+    fn PyList_New(size: isize) -> *mut c_void;
+    fn PyList_SetItem(list: *mut c_void, index: isize, item: *mut c_void) -> c_int;
+    fn PyList_GetItem(list: *mut c_void, index: isize) -> *mut c_void;
+    fn PyList_Size(list: *mut c_void) -> isize;
+    fn Py_IncRef(obj: *mut c_void);
+    fn Py_DecRef(obj: *mut c_void);
+}
 
 static mut GC: Option<GarbageCollector> = None;
-
+static AUTOMATIC_TRACKING: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static OBJECT_REGISTRY: RefCell<HashMap<*mut c_void, PyObject>> = RefCell::new(HashMap::new());
+    static REFCOUNT_CALLBACKS: RefCell<HashMap<*mut c_void, RefCountCallback>> = RefCell::new(HashMap::new());
+    static REFERENCE_TRACKING: RefCell<HashMap<*mut c_void, HashSet<*mut c_void>>> = RefCell::new(HashMap::new());
+    static UNCOLLECTABLE_OBJECTS: RefCell<Vec<*mut c_void>> = RefCell::new(Vec::new());
 }
 
+type RefCountCallback = Box<dyn Fn(*mut c_void, i32) + Send + Sync>;
+
+const PY_TPFLAGS_HAVE_GC: u64 = 0x00000020;
+
+#[repr(C)]
+struct PyObject_HEAD {
+    ob_refcnt: usize,
+    ob_type: *mut PyTypeObject,
+}
+
+#[repr(C)]
+struct PyTypeObject {
+    ob_refcnt: usize,
+    ob_type: *mut PyTypeObject,
+    ob_size: isize,
+    tp_name: *const c_char,
+    tp_basicsize: isize,
+    tp_itemsize: isize,
+    tp_dealloc: Option<unsafe extern "C" fn(*mut c_void)>,
+    tp_print: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, c_int) -> c_int>,
+    tp_getattr: Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void>,
+    tp_setattr: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> c_int>,
+    tp_compare: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+    tp_repr: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
+    tp_as_number: *mut c_void,
+    tp_as_sequence: *mut c_void,
+    tp_as_mapping: *mut c_void,
+    tp_hash: Option<unsafe extern "C" fn(*mut c_void) -> isize>,
+    tp_call: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void>,
+    tp_str: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
+    tp_getattro: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void>,
+    tp_setattro: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> c_int>,
+    tp_as_buffer: *mut c_void,
+    tp_flags: u64,
+    tp_doc: *const c_char,
+    tp_traverse: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> c_int>,
+    tp_clear: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    tp_richcompare: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, c_int) -> *mut c_void>,
+    tp_weaklistoffset: isize,
+    tp_iter: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
+    tp_iternext: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
+    tp_methods: *mut c_void,
+    tp_members: *mut c_void,
+    tp_getset: *mut c_void,
+    tp_base: *mut PyTypeObject,
+    tp_dict: *mut c_void,
+    tp_descr_get:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void>,
+    tp_descr_set: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> c_int>,
+    tp_dictoffset: isize,
+    tp_init: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> c_int>,
+    tp_alloc: Option<unsafe extern "C" fn(*mut PyTypeObject, isize) -> *mut c_void>,
+    tp_new:
+        Option<unsafe extern "C" fn(*mut PyTypeObject, *mut c_void, *mut c_void) -> *mut c_void>,
+    tp_free: Option<unsafe extern "C" fn(*mut c_void)>,
+    tp_is_gc: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    tp_bases: *mut c_void,
+    tp_mro: *mut c_void,
+    tp_cache: *mut c_void,
+    tp_subclasses: *mut c_void,
+    tp_weaklist: *mut c_void,
+    tp_del: Option<unsafe extern "C" fn(*mut c_void)>,
+    tp_version_tag: c_uint,
+    tp_finalize: Option<unsafe extern "C" fn(*mut c_void)>,
+}
 
 #[inline(always)]
 fn with_object_registry<F, R>(f: F) -> R
@@ -23,10 +102,12 @@ where
     })
 }
 
-
 #[inline(always)]
 fn is_object_tracked(obj_ptr: *mut c_void) -> bool {
-    OBJECT_REGISTRY.with(|registry| registry.borrow().contains_key(&obj_ptr))
+    OBJECT_REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        registry.contains_key(&obj_ptr)
+    })
 }
 
 #[inline(always)]
@@ -42,13 +123,135 @@ fn untrack_object_fast(obj_ptr: *mut c_void) -> bool {
 }
 
 
-const COMMON_NAMES: [&str; 4] = ["tracked_ptr", "list", "dict", "tuple"];
 
+
+
+
+
+#[inline(always)]
+fn register_refcount_callback(obj_ptr: *mut c_void, callback: RefCountCallback) {
+    REFCOUNT_CALLBACKS.with(|callbacks| {
+        callbacks.borrow_mut().insert(obj_ptr, callback);
+    });
+}
+
+#[inline(always)]
+fn unregister_refcount_callback(obj_ptr: *mut c_void) {
+    REFCOUNT_CALLBACKS.with(|callbacks| {
+        callbacks.borrow_mut().remove(&obj_ptr);
+    });
+}
+
+#[inline(always)]
+fn notify_refcount_change(obj_ptr: *mut c_void, delta: i32) {
+    REFCOUNT_CALLBACKS.with(|callbacks| {
+        if let Some(callback) = callbacks.borrow().get(&obj_ptr) {
+            callback(obj_ptr, delta);
+        }
+    });
+}
+
+#[inline(always)]
+fn add_reference(from_obj: *mut c_void, to_obj: *mut c_void) {
+    REFERENCE_TRACKING.with(|refs| {
+        let mut refs = refs.borrow_mut();
+        refs.entry(from_obj).or_default().insert(to_obj);
+    });
+}
+
+#[inline(always)]
+fn remove_reference(from_obj: *mut c_void, to_obj: *mut c_void) {
+    REFERENCE_TRACKING.with(|refs| {
+        let mut refs = refs.borrow_mut();
+        if let Some(references) = refs.get_mut(&from_obj) {
+            references.remove(&to_obj);
+            if references.is_empty() {
+                refs.remove(&from_obj);
+            }
+        }
+    });
+}
+
+#[inline(always)]
+fn get_references(from_obj: *mut c_void) -> Vec<*mut c_void> {
+    REFERENCE_TRACKING.with(|refs| {
+        refs.borrow()
+            .get(&from_obj)
+            .map(|references| references.iter().copied().collect())
+            .unwrap_or_default()
+    })
+}
+
+#[inline(always)]
+fn get_referrers(to_obj: *mut c_void) -> Vec<*mut c_void> {
+    REFERENCE_TRACKING.with(|refs| {
+        refs.borrow()
+            .iter()
+            .filter_map(|(from_obj, references)| {
+                references.contains(&to_obj).then_some(*from_obj)
+            })
+            .collect()
+    })
+}
+
+#[inline(always)]
+unsafe fn create_python_list_from_objects(objects: Vec<*mut c_void>) -> *mut c_void {
+    if objects.is_empty() {
+        return std::ptr::null_mut();
+    }
+    
+    let list_size = objects.len() as isize;
+    let py_list = unsafe { PyList_New(list_size) };
+    if py_list.is_null() {
+        return std::ptr::null_mut();
+    }
+    
+    for (index, obj_ptr) in objects.into_iter().enumerate() {
+        if !obj_ptr.is_null() {
+            unsafe {
+                Py_IncRef(obj_ptr);
+                if PyList_SetItem(py_list, index as isize, obj_ptr) != 0 {
+                    Py_DecRef(obj_ptr);
+                }
+            }
+        }
+    }
+    py_list
+}
+
+
+#[inline(always)]
+fn add_uncollectable(obj_ptr: *mut c_void) {
+    UNCOLLECTABLE_OBJECTS.with(|uncollectable| {
+        if !uncollectable.borrow().contains(&obj_ptr) {
+            uncollectable.borrow_mut().push(obj_ptr);
+        }
+    });
+}
+
+#[inline(always)]
+fn remove_uncollectable(obj_ptr: *mut c_void) {
+    UNCOLLECTABLE_OBJECTS.with(|uncollectable| {
+        uncollectable.borrow_mut().retain(|&ptr| ptr != obj_ptr);
+    });
+}
+
+#[inline(always)]
+fn get_uncollectable_objects() -> Vec<*mut c_void> {
+    UNCOLLECTABLE_OBJECTS.with(|uncollectable| uncollectable.borrow().clone())
+}
+
+#[inline(always)]
+fn clear_uncollectable_objects() {
+    UNCOLLECTABLE_OBJECTS.with(|uncollectable| uncollectable.borrow_mut().clear());
+}
+
+const COMMON_NAMES: [&str; 4] = ["tracked_ptr", "list", "dict", "tuple"];
 
 #[inline(always)]
 fn get_fast_object_name(ptr_addr: usize) -> &'static str {
     
-    let index = ptr_addr % COMMON_NAMES.len();
+    let index = ptr_addr & (COMMON_NAMES.len() - 1);
     COMMON_NAMES[index]
 }
 
@@ -100,6 +303,7 @@ impl From<GCResult<usize>> for GCReturnCode {
 pub extern "C" fn py_gc_init() -> GCReturnCode {
     unsafe {
         GC = Some(GarbageCollector::new());
+        AUTOMATIC_TRACKING.store(false, Ordering::Relaxed);
     }
     GCReturnCode::Success
 }
@@ -107,7 +311,13 @@ pub extern "C" fn py_gc_init() -> GCReturnCode {
 #[unsafe(no_mangle)]
 pub extern "C" fn py_gc_cleanup() -> GCReturnCode {
     unsafe {
+        with_object_registry(|reg| reg.clear());
+        REFCOUNT_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
+        REFERENCE_TRACKING.with(|refs| refs.borrow_mut().clear());
+        clear_uncollectable_objects();
+
         GC = None;
+        AUTOMATIC_TRACKING.store(false, Ordering::Relaxed);
     }
     GCReturnCode::Success
 }
@@ -158,10 +368,10 @@ pub extern "C" fn py_gc_is_initialized() -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn py_gc_get_state_string(buffer: *mut c_char, buffer_size: usize) -> GCReturnCode {
+pub unsafe extern "C" fn py_gc_get_state_string(buffer: *mut c_char, buffer_size: usize) -> GCReturnCode {
     if buffer.is_null() || buffer_size == 0 {
-        return GCReturnCode::ErrorInternal;
-    }
+                return GCReturnCode::ErrorInternal;
+            }
 
     unsafe {
         if let Some(ref gc) = GC {
@@ -177,14 +387,14 @@ pub extern "C" fn py_gc_get_state_string(buffer: *mut c_char, buffer_size: usize
 
             let bytes_to_copy = std::cmp::min(state_info.len(), buffer_size - 1);
             std::ptr::copy_nonoverlapping(state_info.as_ptr(), buffer as *mut u8, bytes_to_copy);
-            *buffer.offset(bytes_to_copy as isize) = 0;
+            *buffer.add(bytes_to_copy) = 0;
 
             GCReturnCode::Success
         } else {
             let error_msg = "GC not initialized";
             let bytes_to_copy = std::cmp::min(error_msg.len(), buffer_size - 1);
             std::ptr::copy_nonoverlapping(error_msg.as_ptr(), buffer as *mut u8, bytes_to_copy);
-            *buffer.offset(bytes_to_copy as isize) = 0;
+            *buffer.add(bytes_to_copy) = 0;
 
             GCReturnCode::ErrorInternal
         }
@@ -193,31 +403,20 @@ pub extern "C" fn py_gc_get_state_string(buffer: *mut c_char, buffer_size: usize
 
 #[unsafe(no_mangle)]
 pub extern "C" fn py_gc_track(obj_ptr: *mut c_void) -> GCReturnCode {
-    unsafe {
-        if let Some(ref mut _gc) = GC {
-            if obj_ptr.is_null() {
-                return GCReturnCode::ErrorInternal;
-            }
-
-            
-            if is_object_tracked(obj_ptr) {
-                return GCReturnCode::ErrorAlreadyTracked;
-            }
-
-            
-            let ptr_addr = obj_ptr as usize;
-            let obj_name = get_fast_object_name(ptr_addr);
-
-            
-            let obj = PyObject::new_ffi(obj_name, ObjectData::None, obj_ptr);
-
-            // storing in registry without GC tracking to avoid sync issues
-            track_object_fast(obj_ptr, obj);
-            GCReturnCode::Success
-        } else {
-            GCReturnCode::ErrorInternal
-        }
+    if obj_ptr.is_null() {
+        return GCReturnCode::ErrorInternal;
     }
+
+    if is_object_tracked(obj_ptr) {
+        return GCReturnCode::ErrorAlreadyTracked;
+    }
+
+    let ptr_addr = obj_ptr as usize;
+    let obj_name = get_fast_object_name(ptr_addr);
+    let obj = PyObject::new_ffi(obj_name, ObjectData::None, obj_ptr);
+
+    track_object_fast(obj_ptr, obj);
+    GCReturnCode::Success
 }
 
 #[unsafe(no_mangle)]
@@ -228,7 +427,6 @@ pub extern "C" fn py_gc_untrack(obj_ptr: *mut c_void) -> GCReturnCode {
                 return GCReturnCode::ErrorInternal;
             }
 
-            
             if !untrack_object_fast(obj_ptr) {
                 return GCReturnCode::ErrorNotTracked;
             }
@@ -348,7 +546,7 @@ pub extern "C" fn py_gc_get_threshold(generation: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn py_gc_set_debug(flags: c_int) -> GCReturnCode {
     unsafe {
-        if let Some(ref gc) = GC {
+        if let Some(ref mut gc) = GC {
             if flags < 0 {
                 return GCReturnCode::ErrorInternal;
             }
@@ -377,47 +575,36 @@ pub struct GCStats {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn py_gc_get_stats(stats: *mut GCStats) -> GCReturnCode {
     unsafe {
-        if let Some(ref gc) = GC {
-            if stats.is_null() {
-                return GCReturnCode::ErrorInternal;
-            }
+    if let Some(ref gc) = GC {
+        if stats.is_null() {
+            return GCReturnCode::ErrorInternal;
+        }
 
-            let rust_stats = gc.get_stats();
-            *stats = GCStats {
-                total_tracked: rust_stats.total_tracked as c_int,
-                generation_counts: [
-                    rust_stats.generation_counts[0] as c_int,
-                    rust_stats.generation_counts[1] as c_int,
-                    rust_stats.generation_counts[2] as c_int,
-                ],
-                uncollectable: rust_stats.uncollectable as c_int,
-            };
+        let rust_stats = gc.get_stats();
+        *stats = GCStats {
+            total_tracked: rust_stats.total_tracked as c_int,
+            generation_counts: [
+                rust_stats.generation_counts[0] as c_int,
+                rust_stats.generation_counts[1] as c_int,
+                rust_stats.generation_counts[2] as c_int,
+            ],
+            uncollectable: rust_stats.uncollectable as c_int,
+        };
 
-            GCReturnCode::Success
-        } else {
-            GCReturnCode::ErrorInternal
+        GCReturnCode::Success
+    } else {
+        GCReturnCode::ErrorInternal
         }
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn py_gc_is_tracked(obj_ptr: *mut c_void) -> c_int {
-    unsafe {
-        if let Some(ref _gc) = GC {
             if obj_ptr.is_null() {
                 return 0;
             }
 
-            
-            if is_object_tracked(obj_ptr) {
-                return 1;
-            }
-
-            return 0;
-        } else {
-            return 0;
-        }
-    }
+    is_object_tracked(obj_ptr) as c_int
 }
 
 #[unsafe(no_mangle)]
@@ -457,8 +644,67 @@ pub extern "C" fn py_gc_clear_registry() -> GCReturnCode {
     GCReturnCode::Success
 }
 
+
 #[unsafe(no_mangle)]
-pub extern "C" fn py_gc_get_tracked_info(
+pub extern "C" fn py_gc_add_reference(from_obj: *mut c_void, to_obj: *mut c_void) -> GCReturnCode {
+    if from_obj.is_null() || to_obj.is_null() {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    add_reference(from_obj, to_obj);
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_remove_reference(
+    from_obj: *mut c_void,
+    to_obj: *mut c_void,
+) -> GCReturnCode {
+    if from_obj.is_null() || to_obj.is_null() {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    remove_reference(from_obj, to_obj);
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_mark_uncollectable(obj_ptr: *mut c_void) -> GCReturnCode {
+    if obj_ptr.is_null() {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    add_uncollectable(obj_ptr);
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_unmark_uncollectable(obj_ptr: *mut c_void) -> GCReturnCode {
+    if obj_ptr.is_null() {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    remove_uncollectable(obj_ptr);
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_is_uncollectable(obj_ptr: *mut c_void) -> c_int {
+            if obj_ptr.is_null() {
+                return 0;
+            }
+
+    UNCOLLECTABLE_OBJECTS.with(|uncollectable| {
+        if uncollectable.borrow().contains(&obj_ptr) {
+            1
+        } else {
+            0
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn py_gc_get_tracked_info(
     obj_ptr: *mut c_void,
     buffer: *mut c_char,
     buffer_size: usize,
@@ -477,7 +723,6 @@ pub extern "C" fn py_gc_get_tracked_info(
                 return GCReturnCode::ErrorInternal;
             }
 
-            
             if !is_object_tracked(obj_ptr) {
                 let error_msg = "Pointer not tracked";
                 let bytes_to_copy = std::cmp::min(error_msg.len(), buffer_size - 1);
@@ -486,7 +731,6 @@ pub extern "C" fn py_gc_get_tracked_info(
                 return GCReturnCode::ErrorNotTracked;
             }
 
-            
             let obj_info = with_object_registry(|reg| {
                 if let Some(obj) = reg.get(&obj_ptr) {
                     format!(
@@ -524,7 +768,6 @@ pub extern "C" fn py_gc_debug_untrack(obj_ptr: *mut c_void) -> GCReturnCode {
                 return GCReturnCode::ErrorInternal;
             }
 
-            
             if !untrack_object_fast(obj_ptr) {
                 return GCReturnCode::ErrorNotTracked;
             }
@@ -540,7 +783,6 @@ pub extern "C" fn py_gc_debug_untrack(obj_ptr: *mut c_void) -> GCReturnCode {
 pub extern "C" fn py_gc_debug_state() -> GCReturnCode {
     unsafe {
         if let Some(ref gc) = GC {
-            
             let stats = gc.get_stats();
             println!("GC Debug State:");
             println!("  Total tracked: {}", stats.total_tracked);
@@ -549,15 +791,467 @@ pub extern "C" fn py_gc_debug_state() -> GCReturnCode {
             println!("  Generation 2: {}", stats.generation_counts[2]);
             println!("  Uncollectable: {}", stats.uncollectable);
 
-            
             let registry_count = with_object_registry(|reg| reg.len());
-            println!("  Registry count: {}", registry_count);
+            println!("  Registry count: {registry_count}");
 
             GCReturnCode::Success
         } else {
             GCReturnCode::ErrorInternal
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_enable_automatic_tracking() -> GCReturnCode {
+    AUTOMATIC_TRACKING.store(true, Ordering::Relaxed);
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_disable_automatic_tracking() -> GCReturnCode {
+    AUTOMATIC_TRACKING.store(false, Ordering::Relaxed);
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_is_automatic_tracking_enabled() -> c_int {
+    if AUTOMATIC_TRACKING.load(Ordering::Relaxed) {
+        1
+        } else {
+            0
+        }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_object_created(obj_ptr: *mut c_void) -> GCReturnCode {
+    if !AUTOMATIC_TRACKING.load(Ordering::Relaxed) {
+        return GCReturnCode::Success;
+    }
+
+    unsafe {
+        if obj_ptr.is_null() {
+            return GCReturnCode::ErrorInternal;
+        }
+
+        if is_object_tracked(obj_ptr) {
+            return GCReturnCode::ErrorAlreadyTracked;
+        }
+
+        let py_obj = obj_ptr as *mut PyObject_HEAD;
+        let py_type = (*py_obj).ob_type;
+        let type_name = if !py_type.is_null() {
+            let type_name_ptr = (*py_type).tp_name;
+            if !type_name_ptr.is_null() {
+                std::ffi::CStr::from_ptr(type_name_ptr)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                "unknown".to_string()
+            }
+        } else {
+            "unknown".to_string()
+        };
+
+        let obj = PyObject::new_ffi(&type_name, ObjectData::None, obj_ptr);
+
+        track_object_fast(obj_ptr, obj);
+
+        register_refcount_callback(
+            obj_ptr,
+            Box::new(|obj_ptr, delta| {
+                if delta < 0 && py_gc_get_refcount(obj_ptr) == 0 {
+                    if let Some(ref gc) = GC {
+                        gc.collect_if_needed().ok();
+                    }
+                }
+            }),
+        );
+
+        GCReturnCode::Success
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_object_destroyed(obj_ptr: *mut c_void) -> GCReturnCode {
+    if obj_ptr.is_null() {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    unregister_refcount_callback(obj_ptr);
+
+    if untrack_object_fast(obj_ptr) {
+        GCReturnCode::Success
+    } else {
+        GCReturnCode::ErrorNotTracked
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_refcount_changed(
+    obj_ptr: *mut c_void,
+    old_count: c_int,
+    new_count: c_int,
+) -> GCReturnCode {
+    if !AUTOMATIC_TRACKING.load(Ordering::Relaxed) {
+        return GCReturnCode::Success;
+    }
+
+    unsafe {
+        if obj_ptr.is_null() {
+            return GCReturnCode::ErrorInternal;
+        }
+
+        let delta = new_count - old_count;
+        notify_refcount_change(obj_ptr, delta);
+
+        if new_count == 0 {
+        if let Some(ref gc) = GC {
+                gc.collect_if_needed().ok();
+            }
+        }
+
+        GCReturnCode::Success
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_get_refcount(obj_ptr: *mut c_void) -> c_int {
+    if obj_ptr.is_null() {
+        return 0;
+    }
+
+    with_object_registry(|reg| {
+        if let Some(obj) = reg.get(&obj_ptr) {
+            obj.get_refcount() as c_int
+        } else {
+            unsafe {
+                let py_obj = obj_ptr as *mut PyObject_HEAD;
+                (*py_obj).ob_refcnt as c_int
+            }
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_set_refcount(obj_ptr: *mut c_void, refcount: c_int) -> GCReturnCode {
+    if obj_ptr.is_null() || refcount < 0 {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    let mut success = false;
+    with_object_registry(|reg| {
+        if let Some(obj) = reg.get_mut(&obj_ptr) {
+            let current_refcount = obj.get_refcount();
+            let target_refcount = refcount as usize;
+
+            if target_refcount > current_refcount {
+                for _ in 0..(target_refcount - current_refcount) {
+                    obj.incref();
+                }
+            } else if target_refcount < current_refcount {
+                for _ in 0..(current_refcount - target_refcount) {
+                    obj.decref();
+                }
+            }
+
+            success = true;
+        } else {
+            unsafe {
+                let py_obj = obj_ptr as *mut PyObject_HEAD;
+                let current_refcount = (*py_obj).ob_refcnt;
+                let target_refcount = refcount as usize;
+
+                if target_refcount > current_refcount {
+                    for _ in 0..(target_refcount - current_refcount) {
+                        Py_IncRef(obj_ptr);
+                    }
+                } else if target_refcount < current_refcount {
+                    for _ in 0..(current_refcount - target_refcount) {
+                        Py_DecRef(obj_ptr);
+                    }
+                }
+
+                (*py_obj).ob_refcnt = target_refcount;
+            }
+
+            let ptr_addr = obj_ptr as usize;
+            let type_name = get_fast_object_name(ptr_addr);
+            let obj = PyObject::new_ffi(type_name, ObjectData::None, obj_ptr);
+            reg.insert(obj_ptr, obj);
+            success = true;
+        }
+    });
+
+    if success {
+        GCReturnCode::Success
+    } else {
+        GCReturnCode::ErrorInternal
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn py_gc_get_objects() -> *mut c_void {
+    with_object_registry(|reg| {
+        let objects: Vec<*mut c_void> = reg.keys().copied().collect();
+        unsafe { create_python_list_from_objects(objects) }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn py_gc_get_referrers(obj_ptr: *mut c_void) -> *mut c_void {
+    if obj_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let referrers = get_referrers(obj_ptr);
+    unsafe { create_python_list_from_objects(referrers) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn py_gc_get_referents(obj_ptr: *mut c_void) -> *mut c_void {
+    if obj_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let references = get_references(obj_ptr);
+    unsafe { create_python_list_from_objects(references) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_is_tracked_python(obj_ptr: *mut c_void) -> c_int {
+    if obj_ptr.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        let py_obj = obj_ptr as *mut PyObject_HEAD;
+        let py_type = (*py_obj).ob_type;
+        if !py_type.is_null() {
+            let flags = (*py_type).tp_flags;
+            if (flags & PY_TPFLAGS_HAVE_GC) != 0 && is_object_tracked(obj_ptr) {
+                1
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_track_python(obj_ptr: *mut c_void) -> GCReturnCode {
+    if obj_ptr.is_null() {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    if is_object_tracked(obj_ptr) {
+        return GCReturnCode::ErrorAlreadyTracked;
+    }
+
+    let type_name = unsafe {
+        let py_obj = obj_ptr as *mut PyObject_HEAD;
+        let py_type = (*py_obj).ob_type;
+        if !py_type.is_null() {
+            let type_name_ptr = (*py_type).tp_name;
+            if !type_name_ptr.is_null() {
+                std::ffi::CStr::from_ptr(type_name_ptr)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                "unknown".to_string()
+            }
+        } else {
+            "unknown".to_string()
+        }
+    };
+
+    let obj = PyObject::new_ffi(&type_name, ObjectData::None, obj_ptr);
+
+    track_object_fast(obj_ptr, obj);
+
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_untrack_python(obj_ptr: *mut c_void) -> GCReturnCode {
+    if obj_ptr.is_null() {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    if untrack_object_fast(obj_ptr) {
+        GCReturnCode::Success
+    } else {
+        GCReturnCode::ErrorNotTracked
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_get_collection_counts() -> *mut c_int {
+    unsafe {
+        if let Some(ref gc) = GC {
+            let counts = Box::new([
+                gc.get_generation_count(0).unwrap_or(0) as c_int,
+                gc.get_generation_count(1).unwrap_or(0) as c_int,
+                gc.get_generation_count(2).unwrap_or(0) as c_int,
+            ]);
+            Box::into_raw(counts) as *mut c_int
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn py_gc_free_collection_counts(counts: *mut c_int) {
+    if !counts.is_null() {
+        unsafe {
+            let _ = Box::from_raw(counts);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn py_gc_get_garbage() -> *mut c_void {
+    let uncollectable = get_uncollectable_objects();
+    unsafe { create_python_list_from_objects(uncollectable) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn py_gc_set_garbage(garbage_list: *mut c_void) -> GCReturnCode {
+    if garbage_list.is_null() {
+        clear_uncollectable_objects();
+        return GCReturnCode::Success;
+    }
+
+    clear_uncollectable_objects();
+
+    unsafe {
+        let list_size = PyList_Size(garbage_list);
+        if list_size < 0 {
+            return GCReturnCode::ErrorInternal;
+        }
+
+        for i in 0..list_size {
+            let item = PyList_GetItem(garbage_list, i);
+            if !item.is_null() {
+                Py_IncRef(item);
+                add_uncollectable(item);
+            }
+        }
+    }
+
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_set_debug_flags(flags: c_int) -> GCReturnCode {
+    unsafe {
+        if let Some(ref mut gc) = GC {
+            if flags < 0 {
+                return GCReturnCode::ErrorInternal;
+            }
+            gc.set_debug(flags as u32);
+            GCReturnCode::Success
+        } else {
+            GCReturnCode::ErrorInternal
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_get_debug_flags() -> c_int {
+    unsafe {
+        if let Some(ref gc) = GC {
+            gc.get_debug() as c_int
+        } else {
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_has_finalizer(obj_ptr: *mut c_void) -> c_int {
+    if obj_ptr.is_null() {
+        return 0;
+    }
+
+    with_object_registry(|reg| {
+        if let Some(obj) = reg.get(&obj_ptr) {
+            if obj.has_finalizer { 1 } else { 0 }
+        } else {
+            0
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_set_finalizer(obj_ptr: *mut c_void, has_finalizer: c_int) -> GCReturnCode {
+    if obj_ptr.is_null() {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    with_object_registry(|reg| {
+        if let Some(obj) = reg.get_mut(&obj_ptr) {
+            obj.has_finalizer = has_finalizer != 0;
+            GCReturnCode::Success
+        } else {
+            GCReturnCode::ErrorNotTracked
+        }
+    });
+    GCReturnCode::Success
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn py_gc_get_object_size(obj_ptr: *mut c_void) -> c_int {
+    if obj_ptr.is_null() {
+        return 0;
+    }
+
+    with_object_registry(|reg| {
+        if let Some(obj) = reg.get(&obj_ptr) {
+            obj.get_size() as c_int
+        } else {
+            0
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn py_gc_get_object_type_name(
+    obj_ptr: *mut c_void,
+    buffer: *mut c_char,
+    buffer_size: usize,
+) -> GCReturnCode {
+    if buffer.is_null() || buffer_size == 0 {
+        return GCReturnCode::ErrorInternal;
+    }
+
+    if obj_ptr.is_null() {
+        let error_msg = "NULL pointer";
+        unsafe {
+            let bytes_to_copy = std::cmp::min(error_msg.len(), buffer_size - 1);
+            std::ptr::copy_nonoverlapping(error_msg.as_ptr(), buffer as *mut u8, bytes_to_copy);
+            *buffer.offset(bytes_to_copy as isize) = 0;
+        }
+        return GCReturnCode::ErrorInternal;
+    }
+
+    let type_name = with_object_registry(|reg| {
+        if let Some(obj) = reg.get(&obj_ptr) {
+            obj.type_name.clone()
+        } else {
+            "unknown".to_string()
+        }
+    });
+
+    unsafe {
+        let bytes_to_copy = std::cmp::min(type_name.len(), buffer_size - 1);
+        std::ptr::copy_nonoverlapping(type_name.as_ptr(), buffer as *mut u8, bytes_to_copy);
+        *buffer.offset(bytes_to_copy as isize) = 0;
+    }
+
+    GCReturnCode::Success
 }
 
 #[cfg(test)]

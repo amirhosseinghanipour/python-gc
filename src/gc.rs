@@ -10,6 +10,7 @@ pub struct GarbageCollector {
     collector: Arc<RwLock<Collector>>,
     enabled: bool,
     thresholds: [usize; 3],
+    debug_flags: u32,
 }
 
 impl GarbageCollector {
@@ -18,6 +19,7 @@ impl GarbageCollector {
             collector: Arc::new(RwLock::new(Collector::new())),
             enabled: true,
             thresholds: [700, 10, 10],
+            debug_flags: 0,
         }
     }
 
@@ -33,26 +35,33 @@ impl GarbageCollector {
         self.enabled
     }
 
-    
     pub fn track(&mut self, obj: PyObject) -> GCResult<()> {
         if !self.enabled {
             return Ok(());
         }
 
-        
         {
             let mut collector = self.collector.write();
             collector.track_object_fast(obj)
         }
     }
 
-    
+    pub fn track_bulk(&mut self, objects: Vec<PyObject>) -> GCResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        {
+            let mut collector = self.collector.write();
+            collector.track_objects_bulk(objects)
+        }
+    }
+
     pub fn untrack(&mut self, obj_id: &ObjectId) -> GCResult<()> {
         if !self.enabled {
             return Ok(());
         }
 
-        
         {
             let mut collector = self.collector.write();
             collector.untrack_object_fast(obj_id)
@@ -77,30 +86,31 @@ impl GarbageCollector {
         collector.collect_generation(2)
     }
 
-    
     pub fn needs_collection(&self) -> bool {
         let collector = self.collector.read();
         collector.generation_manager.needs_collection().is_some()
     }
 
-    
     pub fn get_stats(&self) -> crate::collector::GCStats {
         let collector = self.collector.read();
         collector.get_stats()
     }
 
-    pub fn set_debug(&self, flags: u32) {
+    pub fn set_debug(&mut self, flags: u32) {
+        self.debug_flags = flags;
         let mut collector = self.collector.write();
         collector.set_debug(flags);
     }
 
-    
+    pub fn get_debug(&self) -> u32 {
+        self.debug_flags
+    }
+
     pub fn get_count(&self) -> usize {
         let collector = self.collector.read();
         collector.get_stats().total_tracked
     }
 
-    
     pub fn get_generation_count(&self, generation: usize) -> Option<usize> {
         if generation >= 3 {
             return None;

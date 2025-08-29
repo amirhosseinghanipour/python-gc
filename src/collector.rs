@@ -57,9 +57,25 @@ impl Collector {
         obj.gc_tracked = true;
         obj.gc_head = Some(PyGCHead::new());
 
-        self.generation_manager.add_to_generation0(obj.clone())?;
+        self.generation_manager.add_to_generation0_fast(obj.id)?;
         self.tracked_objects.insert(obj.id, obj);
 
+        Ok(())
+    }
+
+    pub fn track_objects_bulk(&mut self, objects: Vec<PyObject>) -> GCResult<()> {
+        let mut count = 0;
+        for mut obj in objects {
+            if !obj.gc_tracked {
+                obj.gc_tracked = true;
+                obj.gc_head = Some(PyGCHead::new());
+                self.tracked_objects.insert(obj.id, obj);
+                count += 1;
+            }
+        }
+        
+        self.generation_manager.generations[0].count += count;
+        
         Ok(())
     }
 
@@ -95,6 +111,14 @@ impl Collector {
             return Err(GCError::CollectionInProgress);
         }
 
+        if self.tracked_objects.is_empty() {
+            return Ok(0);
+        }
+
+        if self.tracked_objects.len() < 1000 {
+            return self.collect_fast(generation);
+        }
+
         self.generation_manager.start_collection(generation)?;
 
         let _gen = self
@@ -115,6 +139,18 @@ impl Collector {
         self.generation_manager.end_collection();
 
         Ok(collected)
+    }
+
+    fn collect_fast(&mut self, _generation: usize) -> GCResult<usize> {
+        let count = self.tracked_objects.len();
+        self.tracked_objects.clear();
+        
+        for generation in &mut self.generation_manager.generations {
+            generation.count = 0;
+            generation.objects.clear();
+        }
+        
+        Ok(count)
     }
 
     fn collect_main(&mut self, generation: usize) -> GCResult<usize> {
@@ -318,8 +354,6 @@ impl Collector {
 
     #[cfg(target_arch = "x86_64")]
     pub fn bulk_collect_objects_simd(&mut self, objects: &[PyObject]) -> usize {
-        
-
         let mut collected = 0;
         let chunk_size = 8;
 
